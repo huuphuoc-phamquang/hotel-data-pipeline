@@ -1,0 +1,99 @@
+# Lưu trữ của data platform trên GKE (namespace data): MinIO (landing, truth, lake) và PostgreSQL + pgvector
+# (Gold, Feast offline/online/registry, MLflow, Airflow metadata). Giữ MinIO thay vì GCS để code không đổi tên bucket
+# (tên bucket GCS là toàn cục). Secret data-secrets tạo từ Vault/ExternalSecret: MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
+# POSTGRES_PASSWORD.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: data
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+  namespace: data
+spec:
+  serviceName: minio
+  replicas: 1
+  selector: { matchLabels: { app: minio } }
+  template:
+    metadata: { labels: { app: minio } }
+    spec:
+      securityContext: { fsGroup: 65532 }   # image chạy user 65532, cấp quyền ghi PD
+      containers:
+        - name: minio
+          image: cgr.dev/chainguard/minio@sha256:1ec745a06a986762f89e68e855fc189f403941eff8c0a5f94767e92c8e39d3f5   # minio/minio đã rời Docker Hub
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: { secretKeyRef: { name: data-secrets, key: MINIO_ACCESS_KEY } }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: data-secrets, key: MINIO_SECRET_KEY } }
+          ports: [{ containerPort: 9000 }, { containerPort: 9001 }]
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: 9000 }
+          volumeMounts: [{ name: data, mountPath: /data }]
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard-rwo     # pd-balanced; landing ~110GB + bronze ~110GB + silver
+        resources: { requests: { storage: 600Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: data
+spec:
+  selector: { app: minio }
+  ports:
+    - { name: api, port: 9000 }
+    - { name: console, port: 9001 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: data
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg17          # Postgres 17 + extension vector cho Feast policy_chunks
+          env:
+            - { name: POSTGRES_DB, value: warehouse }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: data-secrets, key: POSTGRES_PASSWORD } }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          args: ["-c", "shared_buffers=4GB", "-c", "work_mem=64MB", "-c", "max_connections=300"]
+          ports: [{ containerPort: 5432 }]
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "postgres"] }
+          # /dev/shm mặc định của pod chỉ 64MB: query song song (hash join) trên bảng lớn báo DiskFull
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }, { name: dshm, mountPath: /dev/shm }]
+          resources:
+            requests: { cpu: "2", memory: 8Gi }
+      volumes: [{ name: dshm, emptyDir: { medium: Memory, sizeLimit: 1Gi } }]
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: standard-rwo
+        resources: { requests: { storage: 200Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: data
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432 }]

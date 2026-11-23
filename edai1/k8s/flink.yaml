@@ -1,0 +1,46 @@
+# Flink job booking_events_window trên GKE bằng flink-kubernetes-operator.
+# Image = flink:1.20 + PyFlink + jar kafka/jdbc connector + driver PostgreSQL + flink_jobs/ (k8s/flink.Dockerfile).
+# Secret flink-secrets: FEAT_JDBC_URL, FEAT_JDBC_USER, FEAT_JDBC_PASSWORD, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (khoá MinIO
+# cho checkpoint, plugin s3-fs-hadoop đọc từ biến môi trường). Checkpoint lên MinIO (s3) để restart giữ
+# offset Kafka + state dedup (EXACTLY_ONCE).
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: booking-events-window
+  namespace: data
+spec:
+  image: REGISTRY/data/flink-booking:TAG
+  flinkVersion: v1_20
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "2"
+    state.checkpoints.dir: s3://lake/flink/checkpoints
+    s3.endpoint: http://minio.data.svc.cluster.local:9000
+    s3.path.style.access: "true"
+    # backpressure lúc đọc lại backlog: barrier aligned xếp sau buffer đầy nên checkpoint không xong, restart mất tiến độ
+    execution.checkpointing.unaligned.enabled: "true"
+  serviceAccount: flink
+  podTemplate:
+    metadata:
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"   # autoscaler GKE gỡ JobManager khi thu node spot
+    spec:
+      containers:
+        - name: flink-main-container
+          envFrom: [{ secretRef: { name: flink-secrets } }]
+          env:
+            - { name: KAFKA_BOOTSTRAP, value: booking-kafka-bootstrap.data.svc.cluster.local:9092 }
+            # -pyfs chép code sang /tmp trên worker nên đường dẫn tương đối tới schema/ không còn đúng
+            - { name: CONTRACT_PATH, value: /opt/flink/schema/contracts/booking_event.json }
+  jobManager:
+    resource: { memory: 2048m, cpu: 1 }
+  taskManager:
+    resource: { memory: 4096m, cpu: 2 }
+  job:
+    jarURI: local:///opt/flink/opt/flink-python-1.20.1.jar
+    entryClass: org.apache.flink.client.python.PythonDriver
+    # -pyfs: Python worker trên TaskManager không có thư mục của script trong sys.path -> thiếu module contract
+    args: ["-py", "/opt/flink/usrlib/booking_events_window.py", "-pyfs", "/opt/flink/usrlib"]
+    # = số partition booking_events: watermark gán sau source, 1 subtask đọc nhiều partition thì watermark chạy theo
+    # partition nhanh nhất và event của partition chậm thành trễ giả (đo trên GKE với parallelism 2: 2.409 event trễ)
+    parallelism: 6
+    upgradeMode: last-state
